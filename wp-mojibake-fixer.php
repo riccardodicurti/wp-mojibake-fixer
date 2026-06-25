@@ -2,8 +2,8 @@
 /**
  * Plugin Name: WP Mojibake Fixer (IT & DE)
  * Plugin URI:  https://riccardodicurti.it
- * Description: Fixes Italian and German character encoding issues (Mojibake, e.g., Ã¨, Ã¼, ÃŸ) after a database migration. Includes a Charset debug panel.
- * Version:     1.3.1
+ * Description: Fixes Italian and German character encoding issues (Mojibake, e.g., Ã¨, Ã¼, ÃŸ, and the tricky "Ã + NBSP" => à) after a database migration. Includes a Charset debug panel.
+ * Version:     1.4.0
  * Author:      Riccardo Di Curti
  * Author URI:  https://riccardodicurti.it
  * License:     GPL-2.0+
@@ -18,12 +18,12 @@ if ( ! defined( 'ABSPATH' ) ) {
 add_action( 'admin_menu', 'wp_mojibake_fixer_add_menu' );
 function wp_mojibake_fixer_add_menu() {
     add_submenu_page(
-        'tools.php',                 
-        'Fix Mojibake IT/DE',             
-        'Fix Mojibake IT/DE',             
-        'manage_options',            
-        'wp-mojibake-fixer',       
-        'wp_mojibake_fixer_render_page'   
+        'tools.php',
+        'Fix Mojibake IT/DE',
+        'Fix Mojibake IT/DE',
+        'manage_options',
+        'wp-mojibake-fixer',
+        'wp_mojibake_fixer_render_page'
     );
 }
 
@@ -36,9 +36,9 @@ function wp_mojibake_fixer_render_page() {
     // Handle form submission
     if ( isset( $_POST['wp_mojibake_submit'] ) ) {
         if ( check_admin_referer( 'run_mojibake_fix', 'wp_mojibake_nonce' ) ) {
-            wp_mojibake_fixer_execute();
+            $affected = wp_mojibake_fixer_execute();
             echo '<div class="notice notice-success is-dismissible">';
-            echo '<p><strong>🎉 Operation Completed!</strong> The database has been updated successfully. Please clear your cache and check the frontend.</p>';
+            echo '<p><strong>🎉 Operation Completed!</strong> The database has been updated successfully (' . intval( $affected ) . ' rows touched). Please clear your cache and check the frontend.</p>';
             echo '</div>';
         }
     }
@@ -48,16 +48,16 @@ function wp_mojibake_fixer_render_page() {
     // Retrieve System Variables
     $db_charset = defined('DB_CHARSET') ? DB_CHARSET : '<em>Not defined</em>';
     $db_collate = defined('DB_COLLATE') ? DB_COLLATE : '<em>Not defined</em>';
-    
+
     // Retrieve MySQL Server Variables
-    $mysql_charsets = $wpdb->get_results("SHOW VARIABLES LIKE 'character_set%'");
+    $mysql_charsets   = $wpdb->get_results("SHOW VARIABLES LIKE 'character_set%'");
     $mysql_collations = $wpdb->get_results("SHOW VARIABLES LIKE 'collation%'");
 
     ?>
     <div class="wrap">
         <h1>Character Encoding Fixer & Debugger (IT & DE)</h1>
         <p>This tool scans your database (Posts and Postmeta tables) to find and replace broken characters caused by encoding mismatches.</p>
-        
+
         <div class="notice notice-warning inline" style="margin-top: 15px; margin-bottom: 20px;">
             <p><strong>⚠️ IMPORTANT:</strong> Always perform a full database backup before running this tool. Database changes are irreversible.</p>
         </div>
@@ -72,10 +72,10 @@ function wp_mojibake_fixer_render_page() {
         <hr>
 
         <h2>🔍 Debug: Why did this happen?</h2>
-        <p>The "Mojibake" issue usually occurs when there is a mismatch between the encoding of the exported file (e.g., <code>utf8</code>) and how the destination server or <code>wp-config.php</code> imports it (often falling back to <code>latin1</code> or vice versa).</p>
-        
+        <p>The "Mojibake" issue usually occurs when there is a mismatch between the encoding of the exported file (e.g., <code>utf8</code>) and how the destination server or <code>wp-config.php</code> imports it (often falling back to <code>latin1</code> / <code>Windows-1252</code> or vice versa).</p>
+
         <div style="display: flex; gap: 20px; flex-wrap: wrap;">
-            
+
             <!-- WordPress Constants Table -->
             <div style="background: #fff; padding: 15px; border: 1px solid #ccd0d4; box-shadow: 0 1px 1px rgba(0,0,0,.04); min-width: 300px;">
                 <h3>Constants in wp-config.php</h3>
@@ -97,7 +97,7 @@ function wp_mojibake_fixer_render_page() {
                         <tr><th>Variable</th><th>Value</th></tr>
                     </thead>
                     <tbody>
-                        <?php 
+                        <?php
                         foreach($mysql_charsets as $var) {
                             echo "<tr><td><strong>" . esc_html($var->Variable_name) . "</strong></td><td><code>" . esc_html($var->Value) . "</code></td></tr>";
                         }
@@ -109,7 +109,7 @@ function wp_mojibake_fixer_render_page() {
                 </table>
             </div>
         </div>
-        
+
         <p style="margin-top: 30px; font-size: 13px; color: #666;">
             Developed by <a href="https://riccardodicurti.it" target="_blank">Riccardo Di Curti</a>.
         </p>
@@ -120,62 +120,79 @@ function wp_mojibake_fixer_render_page() {
 // 3. The Core Plugin Logic
 function wp_mojibake_fixer_execute() {
     global $wpdb;
+    $affected = 0;
 
-    // Mapping: Broken String => Correct String
+    /**
+     * Mapping: Broken byte-sequence => Correct character.
+     *
+     * IMPORTANT — why the previous version missed every "à":
+     *   "à" (U+00E0) is stored in UTF-8 as the bytes  C3 A0.
+     *   Read by mistake as Windows-1252 it becomes:   Ã (C3) + 0xA0.
+     *   But 0xA0 is a NON-BREAKING SPACE (NBSP), NOT a normal space (0x20).
+     *   The old rule  'Ã ' => 'à'  used a regular space, so it never matched.
+     *
+     *   "À" (U+00C0) is stored as  C3 80. Read as Windows-1252, the byte
+     *   0x80 maps to the Euro sign €, so it surfaces as "Ã€".
+     *
+     * The keys below are written as raw UTF-8 byte escapes for the two
+     * problematic cases, so there is zero ambiguity about invisible
+     * whitespace inside the source file.
+     */
     $mapping = array(
-        // -- FULL WORDS (To prevent trailing "à" breaking issues) --
-        'FelicitÃ'     => 'Felicità',
-        'ospitalitÃ'   => 'ospitalità',
-        'qualitÃ'      => 'qualità',
-        'stagionalitÃ' => 'stagionalità',
-        'novitÃ'       => 'novità',
-        'cittÃ'        => 'città',
-        'specialitÃ'   => 'specialità',
-        'QualitÃ¤t'    => 'Qualität', 
-        
-        // -- GERMAN CHARACTERS (Umlauts & Eszett) --
-        'Ã¤'   => 'ä',
-        'Ã¶'   => 'ö',
-        'Ã¼'   => 'ü',
-        'Ã„'   => 'Ä',
-        'Ã–'   => 'Ö',
-        'Ãœ'   => 'Ü',
-        'ÃŸ'   => 'ß',
-        '”“'   => '–', // Broken en-dash common in DE texts
 
-        // -- ITALIAN CHARACTERS & SYMBOLS --
-        'Ã¨'   => 'è',
-        'Ã©'   => 'é',
-        'Ã '   => 'à',  
-        'Ã¬'   => 'ì',
-        'Ã²'   => 'ò',
-        'Ã¹'   => 'ù',
-        'Ãˆ'   => 'È',
-        'â€™'  => '’', // Typographic Apostrophe
-        'â€˜'  => '‘', // Left Single Quote
-        'â€œ'  => '“', // Left Double Quote
-        'â€'   => '”', // Right Double Quote
-        'â€“'  => '–', // En-dash
-        'Â©'   => '©'   // Copyright symbol
+        // === THE REAL FIX (lowercase à and uppercase À) ===
+        "\xC3\x83\xC2\xA0"     => 'à',  // Ã + NBSP (C3 83 C2 A0) => à
+        "\xC3\x83\xE2\x82\xAC" => 'À',  // Ã + €    (C3 83 E2 82 AC) => À
+
+        // === GERMAN CHARACTERS (Umlauts & Eszett) ===
+        'Ã¤' => 'ä',
+        'Ã¶' => 'ö',
+        'Ã¼' => 'ü',
+        'Ã„' => 'Ä',
+        'Ã–' => 'Ö',
+        'Ãœ' => 'Ü',
+        'ÃŸ' => 'ß',
+
+        // === ITALIAN CHARACTERS ===
+        'Ã¨' => 'è',
+        'Ã©' => 'é',
+        'Ã¬' => 'ì',
+        'Ã²' => 'ò',
+        'Ã¹' => 'ù',
+        'Ãˆ' => 'È',
+
+        // === TYPOGRAPHIC PUNCTUATION ===
+        // Order matters: the longer 'â€x' sequences MUST come before the
+        // bare 'â€' (right double quote), otherwise the short one eats them.
+        'â€™' => '’',  // Typographic apostrophe
+        'â€˜' => '‘',  // Left single quote
+        'â€œ' => '“',  // Left double quote
+        'â€“' => '–',  // En-dash
+        'â€”' => '—',  // Em-dash
+        'â€'  => '”',  // Right double quote (keep LAST in this group)
+        'Â©'  => '©',  // Copyright symbol
     );
 
     foreach ( $mapping as $broken => $correct ) {
+
         // Fix main content
-        $wpdb->query( $wpdb->prepare(
-            "UPDATE {$wpdb->posts} SET 
-            post_content = REPLACE(post_content, %s, %s),
-            post_title = REPLACE(post_title, %s, %s),
-            post_excerpt = REPLACE(post_excerpt, %s, %s)",
-            $broken, $correct, 
-            $broken, $correct, 
+        $affected += (int) $wpdb->query( $wpdb->prepare(
+            "UPDATE {$wpdb->posts} SET
+                post_content = REPLACE(post_content, %s, %s),
+                post_title   = REPLACE(post_title,   %s, %s),
+                post_excerpt = REPLACE(post_excerpt, %s, %s)",
+            $broken, $correct,
+            $broken, $correct,
             $broken, $correct
         ) );
-        
-        // Fix meta data (Crucial for Page Builders like Elementor, ACF, etc.)
-        $wpdb->query( $wpdb->prepare(
-            "UPDATE {$wpdb->postmeta} SET 
-            meta_value = REPLACE(meta_value, %s, %s)",
+
+        // Fix meta data (crucial for page builders: Salient/WPBakery, ACF, Elementor, etc.)
+        $affected += (int) $wpdb->query( $wpdb->prepare(
+            "UPDATE {$wpdb->postmeta} SET
+                meta_value = REPLACE(meta_value, %s, %s)",
             $broken, $correct
         ) );
     }
+
+    return $affected;
 }
