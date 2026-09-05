@@ -3,7 +3,7 @@
  * Plugin Name: WP Mojibake Fixer (IT & DE)
  * Plugin URI:  https://riccardodicurti.it
  * Description: Fixes Italian and German character encoding issues (Mojibake, e.g., Ã¨, Ã¼, ÃŸ, and the tricky "Ã + NBSP" => à) after a database migration. Includes a Charset debug panel.
- * Version:     1.4.0
+ * Version:     1.4.1
  * Author:      Riccardo Di Curti
  * Author URI:  https://riccardodicurti.it
  * License:     GPL-2.0+
@@ -134,9 +134,20 @@ function wp_mojibake_fixer_execute() {
      *   "À" (U+00C0) is stored as  C3 80. Read as Windows-1252, the byte
      *   0x80 maps to the Euro sign €, so it surfaces as "Ã€".
      *
-     * The keys below are written as raw UTF-8 byte escapes for the two
-     * problematic cases, so there is zero ambiguity about invisible
-     * whitespace inside the source file.
+     * IMPORTANT — v1.4.1 fix for the German low opening quote „:
+     *   „ (U+201E) is stored in UTF-8 as bytes E2 80 9E.
+     *   Read as Windows-1252 that becomes:  â (E2) + € (80) + ž (9E)
+     *   i.e. the mojibake string "â€ž".
+     *   The old mapping only had the generic fallback 'â€' => '”' (used
+     *   for the plain right double quote), and since REPLACE() matches
+     *   substrings, that generic rule fired INSIDE "â€ž" too, consuming
+     *   only the "â€" part and leaving the trailing "ž" orphaned. That
+     *   produced the broken "”ž" you saw on the live site instead of „.
+     *   The fix: add a dedicated rule for 'â€ž' BEFORE the generic
+     *   fallback (order matters, same as for the other multi-byte
+     *   sequences below) — plus a cleanup rule for '”ž', because the
+     *   site was already run once and the DB now contains that
+     *   half-converted artifact instead of the original mojibake.
      */
     $mapping = array(
 
@@ -162,8 +173,10 @@ function wp_mojibake_fixer_execute() {
         'Ãˆ' => 'È',
 
         // === TYPOGRAPHIC PUNCTUATION ===
-        // Order matters: the longer 'â€x' sequences MUST come before the
-        // bare 'â€' (right double quote), otherwise the short one eats them.
+        // Order matters: longer / more specific 'â€x' sequences MUST come
+        // before the bare 'â€', otherwise the short rule eats them first
+        // and leaves trailing bytes orphaned (see â€ž note above).
+        'â€ž' => '„',  // German opening low quote (NEW in 1.4.1)
         'â€™' => '’',  // Typographic apostrophe
         'â€˜' => '‘',  // Left single quote
         'â€œ' => '“',  // Left double quote
@@ -171,6 +184,11 @@ function wp_mojibake_fixer_execute() {
         'â€”' => '—',  // Em-dash
         'â€'  => '”',  // Right double quote (keep LAST in this group)
         'Â©'  => '©',  // Copyright symbol
+
+        // === CLEANUP for the half-converted state left by v1.4.0 ===
+        // A previous run already turned 'â€ž' into '”ž' (see note above).
+        // This catches that intermediate artifact directly.
+        '”ž' => '„',   // NEW in 1.4.1
     );
 
     foreach ( $mapping as $broken => $correct ) {
